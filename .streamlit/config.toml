@@ -1,0 +1,11 @@
+[server]
+headless = true
+enableCORS = false        # allow embedding in an iframe
+enableXsrfProtection = false
+port = 8501
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
