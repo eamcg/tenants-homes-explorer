@@ -1,11 +1,9 @@
 # app.py — Tenants × Homes Explorer (CSV+GeoJSON)
 # Single-scenario UX with a "Run analysis" button; custom filters only when Custom is chosen
-
+from __future__ import annotations
 import io, json
 from typing import Optional
 import pandas as pd
-import geopandas as gpd
-from shapely.geometry import shape
 import streamlit as st
 import matplotlib.pyplot as plt
 
@@ -29,6 +27,17 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+with st.expander("Diagnostics", expanded=False):
+    import sys, importlib
+    st.write({
+        "python": sys.version.split()[0],
+        "pandas": pd.__version__,
+        "streamlit": st.__version__,
+        "geopandas importable": importlib.util.find_spec("geopandas") is not None,
+        "shapely importable": importlib.util.find_spec("shapely") is not None,
+        "pyproj importable": importlib.util.find_spec("pyproj") is not None,
+    })
+
 # ============================================================
 # Helpers (preprocessing & core logic)
 # ============================================================
@@ -39,6 +48,9 @@ def geojson_col(df: pd.DataFrame) -> str:
     raise ValueError("No GeoJSON column found. SQL export should alias geometry as e.g. `geom_geojson`.")
 
 def df_geojson_to_gdf(df: pd.DataFrame, geojson_colname: str, crs="EPSG:4326") -> gpd.GeoDataFrame:
+    import geopandas as gpd
+    from shapely.geometry import shape
+
     geom = df[geojson_colname].apply(lambda s: shape(json.loads(s)) if pd.notnull(s) else None)
     return gpd.GeoDataFrame(df.drop(columns=[geojson_colname]), geometry=geom, crs=crs)
 
@@ -65,7 +77,69 @@ def prep_frames(homes_gdf: gpd.GeoDataFrame, areas_gdf: gpd.GeoDataFrame):
     tenants = tenants[tenant_cols].copy()
     return homes, tenants
 
+def spatial_candidates_fallback(homes, tenants, predicate: str):
+    from shapely.strtree import STRtree
+
+    tree = STRtree(tenants.geometry.values)
+    geom_to_idx = {geom: i for i, geom in enumerate(tenants.geometry.values)}
+
+    pairs = []
+    H = homes.reset_index(drop=True)
+    for hi, hrow in H.iterrows():
+        hgeom = hrow.geometry
+        if hgeom is None or hgeom.is_empty:
+            continue
+        cand_geoms = tree.query(hgeom)
+        if not cand_geoms:
+            continue
+        idxs = [geom_to_idx[g] for g in cand_geoms]
+        sub = tenants.iloc[idxs]
+
+        if predicate == "within":
+            mask = sub.geometry.within(hgeom)
+        elif predicate == "intersects":
+            mask = sub.geometry.intersects(hgeom)
+        else:
+            raise ValueError("predicate must be 'within' or 'intersects'")
+
+        for ti in sub[mask].index:
+            pairs.append((hi, ti))
+
+    if not pairs:
+        return pd.DataFrame(columns=["home_id", "t_tenant_ad_id"])
+
+    left  = H.iloc[[i for i, _ in pairs]].reset_index(drop=True).add_suffix("_home")
+    right = tenants.iloc[[j for _, j in pairs]].reset_index(drop=True).add_suffix("_tenant")
+    merged = pd.concat([left, right], axis=1)
+
+    # column renames to what the rest of your code expects
+    mapping = {
+        "home_id_home": "home_id",
+        "rent_home": "rent",
+        "home_allows_pets_home": "home_allows_pets",
+        "shared_home": "home_shared",
+        "start_optimal_home": "home_start_optimal",
+        "tenant_ad_id_tenant": "t_tenant_ad_id",
+        "max_monthly_cost_tenant": "t_max_monthly_cost",
+        "pets_tenant": "t_pets",
+        "shared_tenant": "t_shared",
+        "start_optimal_tenant": "t_start_optimal",
+        "currency_home": "home_currency",
+        "currency_tenant": "t_currency",
+        "country_home": "home_country",
+        "country_tenant": "t_country",
+        "market_home": "home_market",
+        "market_tenant": "t_market",
+    }
+    for k, v in mapping.items():
+        if k in merged.columns:
+            merged.rename(columns={k: v}, inplace=True)
+
+    return merged
+
 def spatial_candidates(homes: gpd.GeoDataFrame, tenants: gpd.GeoDataFrame, predicate: str) -> pd.DataFrame:
+    import geopandas as gpd
+
     candidates = gpd.sjoin(homes, tenants, predicate=predicate, how="left", lsuffix="home", rsuffix="tenant")
     cand = candidates.dropna(subset=["tenant_ad_id"]).copy()
 
@@ -417,6 +491,7 @@ if not (homes_file and tenants_file):
 try:
     homes_df = pd.read_csv(io.BytesIO(homes_file.getvalue()))
     tenants_df = pd.read_csv(io.BytesIO(tenants_file.getvalue()))
+    import geopandas as gpd
     homes_geo_col = geojson_col(homes_df)
     tenants_geo_col = geojson_col(tenants_df)
 except Exception as e:
@@ -449,7 +524,11 @@ same_currency_only = st.checkbox(
 
 with st.spinner("Checking spatial overlaps…"):
     homes, tenants = prep_frames(homes_gdf, areas_gdf)
-    cand = spatial_candidates(homes, tenants, predicate=predicate)
+    try:
+        cand = spatial_candidates(homes, tenants, predicate=predicate)
+    except Exception as e:
+        st.warning(f"Falling back to STRtree join (server missing rtree/pygeos?): {e}")
+        cand = spatial_candidates_fallback(homes, tenants, predicate=predicate)
 
 # Apply currency filter after building cand
 removed_pairs = 0
