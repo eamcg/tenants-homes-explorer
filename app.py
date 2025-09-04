@@ -133,12 +133,10 @@ def _tenant_id_col(df: pd.DataFrame) -> Optional[str]:
 def distribution_for_case(
     cand_df: pd.DataFrame,
     homes: pd.DataFrame,
-    # NEW: explicit subset rules
     homes_shared_only: bool = False,        # keep only homes where home_shared == True
     homes_no_pets_only: bool = False,       # keep only homes where home_allows_pets == False
     tenants_require_shared: bool = False,   # keep only tenants where t_shared == True
     tenants_require_no_pets: bool = False,  # keep only tenants where t_pets == False
-    # existing rules
     rent_mode: str = "exact",               # "exact" or "plus5"
     date_within_days: Optional[int] = None,
 ) -> pd.DataFrame:
@@ -200,12 +198,33 @@ def distribution_for_case(
                 .reset_index()
             )
         else:
-            per_home = pd.DataFrame(columns=["home_id", "tenant_count"])
+            per_home = pd.DataFrame(columns=["home_id", "tenant_count"]) 
 
     else:
         per_home = pd.DataFrame(columns=["home_id","tenant_count"])
 
-    all_homes = homes[["home_id"]].drop_duplicates()
+    # --- Determine denominator: homes eligible by spatial + currency + home flags (no tenant filters) ---
+    eligible_base = cand_df.copy()
+
+    # currency guard (same logic as above)
+    if "home_currency" in eligible_base and "t_currency" in eligible_base:
+        eligible_base = eligible_base[
+            eligible_base["home_currency"].isna()
+            | eligible_base["t_currency"].isna()
+            | (eligible_base["home_currency"] == eligible_base["t_currency"])
+        ]
+
+    # home flags
+    if homes_shared_only and "home_shared" in eligible_base:
+        eligible_base = eligible_base[eligible_base["home_shared"] == True]
+    if homes_no_pets_only and "home_allows_pets" in eligible_base:
+        eligible_base = eligible_base[eligible_base["home_allows_pets"] == False]
+
+    eligible_ids = eligible_base["home_id"].drop_duplicates()
+
+    # denominator = only eligible homes
+    all_homes = homes[homes["home_id"].isin(eligible_ids)][["home_id"]].drop_duplicates()
+
     per_home = all_homes.merge(per_home, on="home_id", how="left").fillna({"tenant_count":0})
     per_home["tenant_count"] = per_home["tenant_count"].astype(int)
 
@@ -218,26 +237,30 @@ def distribution_for_case(
 
 def distribution_control(cand_df: pd.DataFrame, homes: pd.DataFrame) -> pd.DataFrame:
     df = cand_df.copy()
-    if len(df) > 0:
-        
-        tid = _tenant_id_col(df)
-        if tid and len(df) > 0:
-            per_home = (
-                df.groupby("home_id")[tid]
-                .nunique()
-                .rename("tenant_count")
-                .reset_index()
-            )
-        else:
-            per_home = pd.DataFrame(columns=["home_id", "tenant_count"])
-        
+
+    # unique tenants per home (no tenant filters in Control)
+    tid = _tenant_id_col(df)
+    if tid and len(df) > 0:
+        per_home = (
+            df.groupby("home_id")[tid]
+              .nunique()
+              .rename("tenant_count")
+              .reset_index()
+        )
     else:
-        per_home = pd.DataFrame(columns=["home_id","tenant_count"])
-    all_homes = homes[["home_id"]].drop_duplicates()
-    per_home = all_homes.merge(per_home, on="home_id", how="left").fillna({"tenant_count":0})
+        per_home = pd.DataFrame(columns=["home_id", "tenant_count"])
+
+    # Denominator = homes with any spatial overlap (cand_df already reflects currency guard)
+    eligible_ids = df["home_id"].drop_duplicates()
+    all_homes = homes[homes["home_id"].isin(eligible_ids)][["home_id"]].drop_duplicates()
+
+    per_home = all_homes.merge(per_home, on="home_id", how="left").fillna({"tenant_count": 0})
     per_home["tenant_count"] = per_home["tenant_count"].astype(int)
-    dist = (per_home.value_counts(subset=["tenant_count"]).rename("n_homes")
-                  .reset_index().sort_values("tenant_count").reset_index(drop=True))
+
+    dist = (
+        per_home.value_counts(subset=["tenant_count"]).rename("n_homes")
+        .reset_index().sort_values("tenant_count").reset_index(drop=True)
+    )
     total = len(all_homes)
     dist["pct"] = (dist["n_homes"] / total * 100).round(1)
     dist["cum_pct"] = (dist["n_homes"].cumsum() / total * 100).round(1)
