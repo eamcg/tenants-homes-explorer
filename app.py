@@ -78,27 +78,38 @@ def prep_frames(homes_gdf: gpd.GeoDataFrame, areas_gdf: gpd.GeoDataFrame):
     return homes, tenants
 
 def spatial_candidates_fallback(homes, tenants, predicate: str):
+    # Pure-Shapely fallback join using STRtree (no rtree/pygeos required)
     from shapely.strtree import STRtree
 
-    tree = STRtree(tenants.geometry.values)
-    geom_to_idx = {geom: i for i, geom in enumerate(tenants.geometry.values)}
+    # Build a spatial index over tenant geometries
+    tenant_geoms = list(tenants.geometry.values)  # keep a stable list
+    tree = STRtree(tenant_geoms)
+
+    # Map back from returned geometry objects using id()
+    id_to_idx = {id(g): i for i, g in enumerate(tenant_geoms)}
 
     pairs = []
     H = homes.reset_index(drop=True)
+
     for hi, hrow in H.iterrows():
         hgeom = hrow.geometry
         if hgeom is None or hgeom.is_empty:
             continue
+
+        # Broad-phase: bbox hits
         cand_geoms = tree.query(hgeom)
         if not cand_geoms:
             continue
-        idxs = [geom_to_idx[g] for g in cand_geoms]
+
+        idxs = [id_to_idx[id(g)] for g in cand_geoms]
         sub = tenants.iloc[idxs]
 
-        if predicate == "within":
-            mask = sub.geometry.within(hgeom)
-        elif predicate == "intersects":
+        # Narrow-phase: exact predicate
+        if predicate == "intersects":
             mask = sub.geometry.intersects(hgeom)
+        elif predicate == "within":
+            # "home within tenant" == "tenant contains home"
+            mask = sub.geometry.contains(hgeom)
         else:
             raise ValueError("predicate must be 'within' or 'intersects'")
 
@@ -523,12 +534,16 @@ same_currency_only = st.checkbox(
 )
 
 with st.spinner("Checking spatial overlaps…"):
-    homes, tenants = prep_frames(homes_gdf, areas_gdf)
     try:
-        cand = spatial_candidates(homes, tenants, predicate=predicate)
+        homes, tenants = prep_frames(homes_gdf, areas_gdf)
+        try:
+            cand = spatial_candidates(homes, tenants, predicate=predicate)
+        except Exception as e1:
+            st.warning(f"Falling back to STRtree join (server missing rtree/pygeos?): {e1}")
+            cand = spatial_candidates_fallback(homes, tenants, predicate=predicate)
     except Exception as e:
-        st.warning(f"Falling back to STRtree join (server missing rtree/pygeos?): {e}")
-        cand = spatial_candidates_fallback(homes, tenants, predicate=predicate)
+        st.exception(e)   # <-- shows the full traceback in the app
+        st.stop()
 
 # Apply currency filter after building cand
 removed_pairs = 0
